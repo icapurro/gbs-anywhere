@@ -1,0 +1,1037 @@
+openapi: 3.1.0
+
+info:
+  title: Grind-by-Sync Generic WiFi API
+  version: 0.1.0-draft
+  summary: How an espresso machine pairs with an E65/E80 GbS grinder and reports each shot to it.
+  description: |
+    The Mahlkönig E65/E80 GbS grinders (E65W, E65T, E80W and E80T) have a
+    **Generic WiFi** option under *Settings → Connectivity → Machine To
+    Machine*. With it, any device on the same network can stand in for the
+    espresso machine: it pairs with the grinder once, then answers each
+    Grind-by-Sync grind with the shot's time and weight, and the grinder
+    adjusts its grind setting.
+
+    This document describes that API so the flow can be reproduced by hand
+    (with `curl`) or in any language. It is written from
+    [gbs-anywhere](https://github.com/Skamba/gbs-anywhere), which implements
+    the machine side. Tested with the E65W GbS on firmware V01.36 build #2;
+    the other models offer the same option.
+
+    *Not affiliated with Mahlkönig or Hemro.*
+
+    ## Who calls whom
+
+    The **grinder is the server** and the **machine is the client**. The
+    machine calls the grinder; the grinder never calls the machine, and needs
+    no route back to it.
+
+    ```text
+    machine (you)  --- HTTPS POST, port 30001 --->  grinder
+    ```
+
+    (The E64 WS works the other way round: it polls the machine over plain
+    HTTP. That is a different API, not described here.)
+
+    ## How to read the rules
+
+    Each rule in this document carries one of three labels:
+
+    | Label | Meaning |
+    |---|---|
+    | **[grinder]** | How the grinder behaves, or what it requires. A client that ignores it will not work reliably. |
+    | **[client policy]** | A choice gbs-anywhere makes. It works well, but other values or strategies are fine. |
+    | **[unconfirmed]** | Not known for certain. Don't build on it without checking. |
+
+    ## What you need
+
+    ### On the grinder
+
+    | What | Setting | Label |
+    |---|---|---|
+    | Model and firmware | E65W GbS, firmware V01.36 build #2 (shown as V01.36-2). The other E65/E80 GbS models offer Generic WiFi too. | [grinder] tested; others [unconfirmed] |
+    | Network | Joined to the same network as the machine. | [grinder] |
+    | Generic WiFi | *Settings → Connectivity → Machine To Machine →* **Generic WiFi** on. *Clear Pairing* switches it off. | [grinder] |
+    | Other machine links | Leave the other *Machine To Machine* options off. | [client policy]; whether it is required is [unconfirmed] |
+    | Grouphead Selection | **Grouphead 1** (for a one-group machine) or **All**. Grind-by-Sync only learns from shots of the selected group. | [grinder] |
+    | A Grind-by-Sync recipe | **Enable GbS** on, with **Brew Time** (the target time), **Brew Weight** (target weight in the cup, optional) and **GbS start DD** (the grind setting to start from). The recipe shows a blue chain icon. A new recipe can be made with *Settings → Setup Assistance → Assisted Dial-in*, answering yes to "Fine-tune with GbS?". | [grinder] |
+
+    Where things are on the grinder, as labelled on the tested firmware
+    (**[unconfirmed]** whether other firmware nests them the same way):
+
+    ```text
+    Settings
+      Connectivity
+        Machine To Machine
+          Generic WiFi ............ on / off
+          Grouphead Selection ..... Grouphead 1 / ... / All
+          Enable <name> ........... after pairing: the machine's entry, with
+                                    "local wifi connected" and Status Off / On
+          Generic WiFi
+            Configuration ......... Pairing ID (first line), Start Pairing,
+                                    Available devices, Accept Pairing,
+                                    Clear Pairing
+            Diagnosis ............. Pairing ID (after the serial number),
+                                    activity status, group state
+    ```
+
+    ### On the machine side
+
+    - **The grinder's IP address.** The machine has to know it: nothing in
+      this API finds the grinder. **[unconfirmed]** whether the grinder
+      announces itself on the network (mDNS, SSDP or a broadcast). Give the
+      grinder a fixed address in the router (a DHCP reservation), so the
+      machine keeps finding it.
+    - **A route to the grinder's TCP port 30001.** The grinder never connects
+      to the machine, so nothing has to be opened towards the machine.
+    - **An HTTPS client** that skips certificate verification, sends
+      `Content-Length` with that casing, opens a new connection for every
+      request, and has a timeout (gbs-anywhere uses 8 s). See *Transport*.
+    - **Storage** that keeps `brewDeviceId` and `pairingId` across restarts.
+    - **A screen and a way to type**, for the person to compare the
+      `pairingCode` with the grinder's and to type in the Pairing ID the
+      grinder shows (see *Pairing*).
+    - **The shot's time,** from a timer, a scale or the espresso machine.
+      The weight is optional: the grinder adjusts from the time alone.
+
+    ## Transport
+
+    - **[grinder]** HTTPS on port **30001**, at the grinder's IP address,
+      for example `https://192.168.1.30:30001`.
+    - **[grinder]** The grinder's TLS certificate is self-signed and names no
+      host, so it cannot be verified. Clients must skip certificate
+      verification (`curl -k`). Send requests only to the address the person
+      configured, and don't follow redirects.
+    - **[grinder]** Every request is a `POST` with a JSON body
+      (`Content-Type: application/json`) that includes `"version": 1`.
+    - **[grinder]** The header must be spelled **`Content-Length`**. With a
+      lower-case `content-length`, the grinder reads an empty body. Most HTTP/1.1
+      clients, `curl` among them, already send it this way; some libraries need
+      an option (for example title-case headers).
+    - **[grinder]** The grinder closes idle kept-alive connections without
+      notice, so a request sent on a reused connection can fail with
+      "connection closed". Open a **new connection for every request**.
+    - **[grinder]** Every reply is a JSON object with a `status`: `"Ok"`
+      (HTTP 200), or an error name starting with `ClientError` (HTTP 400).
+      Replies also carry a `msgType`, such as `"brewJobsRes"`. An unknown
+      `pairingId` gets HTTP 403 with an empty body instead.
+    - **[grinder]** Replies carry CORS headers
+      (`Access-Control-Allow-Origin: *`) and the grinder answers `OPTIONS`
+      preflight requests, so a web page can call it directly once the
+      browser has accepted the grinder's self-signed certificate.
+      **[unconfirmed]** the easiest way to get a browser to accept it.
+    - **[grinder]** Replies are indented, multi-line JSON
+      (`Content-Type: application/json; charset=utf-8`). Parse them as JSON
+      rather than matching the text.
+    - **[grinder]** Replies are labelled UTF-8, but some non-ASCII text (such
+      as the ö in the grinder maker's name) arrives as Latin-1. Decode as
+      UTF-8 and fall back to Latin-1 when that fails.
+    - **[grinder]** There is no login or token. After pairing, the
+      `pairingId` in each request body identifies the machine.
+
+    ## The whole flow
+
+    ![Sequence diagram: pairing, waiting for a grind, taking the job and reporting the shot](./sequence.svg)
+
+    The diagram's source is `sequence.mmd` (Mermaid), next to this file.
+
+    ## Pairing
+
+    Before pairing:
+
+    - **[grinder]** Generic WiFi must be switched on (*Settings →
+      Connectivity → Machine To Machine*). *Clear Pairing* switches it off
+      again, so switch it back on after clearing an old pairing.
+    - **[grinder]** Set **Grouphead Selection** to the group the machine
+      reports for (group 1 for a one-group machine) or to **All**:
+      Grind-by-Sync only learns from shots of the selected group.
+
+    ### Accepting the pairing restarts the grinder
+
+    **[grinder]** On the E65W with firmware V01.36 build #2, pairing never
+    finishes the way the API suggests (`pairingStatus` answering
+    `accepted: true` with a `pairingId`). Instead:
+
+    - Tapping **Accept Pairing** stores nothing by itself. Re-applying
+      afterwards still answers `Ok` with the same application.
+    - The first `pairingStatus` after Accept **gets no reply**. The request
+      hangs, the grinder freezes, and it restarts about 90 s later. During
+      that call it stores the pairing.
+    - The pairing survives the restart only if that call came **soon after
+      Accept**, while the pairing screen was still open, and **nothing
+      reaches the grinder while it restarts**. A call 36 s after Accept kept
+      the pairing. A call about 2 minutes later, after the pairing screen
+      had timed out, still crashed the grinder but lost the pairing.
+    - The machine never receives the `pairingId`. The person reads it on the
+      grinder, in the machine's entry (first line of *Generic WiFi →
+      Configuration*, or under *Diagnosis*).
+
+    ### Steps
+
+    ```text
+     machine                                   grinder                       person
+       pairingApplication  ------------------>  Ok, applicationId, pairingCode
+       pairingStatus (every 2 s) ------------>  accepted: false               Start Pairing, then
+                                                                              Accept on the entry
+       pairingStatus (within seconds) ------->  no reply: freezes, restarts
+       ...send nothing for 3 minutes...
+       pairingApplication (same device id) -->  400 ClientErrorDevAlreadyPaired
+                                                                              reads the Pairing ID
+       brewJobs {pairingId} ----------------->  Ok: paired (403: wrong ID)
+    ```
+
+    1. The machine sends `pairingApplication` with a `brewDeviceId` it
+       generated once (a UUID) and keeps. The grinder answers with an
+       `applicationId` and a `pairingCode`. **[grinder]** Sending it again
+       with the same `brewDeviceId` while the application is open returns the
+       same `applicationId` and `pairingCode`. `applicationId` is an opaque
+       number (five-digit values seen), not a counter from 1.
+    2. **[grinder]** The person opens *Generic WiFi → Configuration → Start
+       Pairing*. The grinder lists the machine under **Available devices** by
+       its `name`, next to the `pairingCode`. Show the code to the person so
+       they pick the right entry, then they tap **Accept Pairing**.
+       **[grinder]** The code is only for the person: no request sends it
+       back. It is short (two digits seen) and can repeat across
+       applications, so compare the name as well.
+       **[grinder]** The pairing screen times out by itself after a while
+       (**[unconfirmed]** how long). Start Pairing again if it does.
+    3. The machine calls `pairingStatus` every 2 s. Before Accept it answers
+       `accepted: false`. Right after Accept, the next call hangs and the
+       grinder restarts (see above). Polling every 2 s makes that call come
+       within seconds of Accept, which is what keeps the pairing.
+    4. **[client policy]** When a `pairingStatus` call gets no answer, send
+       the grinder **nothing for 3 minutes**.
+    5. Send `pairingApplication` again with the same `brewDeviceId`.
+       - **[grinder]** `ClientErrorDevAlreadyPaired`: the pairing was kept.
+       - **[grinder]** `Ok`: it was lost. Have the person accept again (the
+         grinder may hand out the same application and code).
+    6. The person reads the **Pairing ID** on the grinder and types it into
+       the machine. Check it with `brewJobs`: `Ok` means paired, HTTP 403
+       means the ID is wrong.
+    7. Keep polling `brewJobs`. **[grinder]** After pairing, the grinder's
+       *Machine To Machine* menu lists the machine by its `name` (*Enable
+       <name>*). Its status reads **Off** until the machine polls, then
+       **On**. The pairing outlives a pause: polling again after 9 hours
+       worked without pairing again.
+    8. **[client policy]** Store `brewDeviceId` and `pairingId` together and
+       keep them across restarts. Without them, the machine has to pair
+       again.
+
+    Recovering from problems:
+
+    - **[grinder]** `ClientErrorPairingAppIdNotFound` from `pairingStatus`:
+      the application expired, or the grinder restarted. Send
+      `pairingApplication` again.
+    - **[grinder]** `ClientErrorDevAlreadyPaired` from
+      `pairingApplication`: the grinder already has this `brewDeviceId`
+      paired. Have the person type in the Pairing ID, as in step 6.
+    - **[grinder]** When the pairing is cleared on the grinder (*Clear
+      Pairing*), `brewJobs` answers HTTP **403**. Switch Generic WiFi back
+      on and pair again.
+
+    ## Brew jobs
+
+    **[grinder]** Each Grind-by-Sync grind creates one **brew job**: the
+    grinder asking for that shot's numbers. The machine finds jobs by
+    polling `brewJobs`, takes one with `brewAccept`, and answers it with
+    `brewDone`.
+
+    - **[grinder]** Only grinds with a Grind-by-Sync recipe create a job. A
+      grind with a recipe that has *Enable GbS* off creates none.
+    - **[grinder]** The job shows up in the next `brewJobs` reply after the
+      grind. There is no knob press or other step on the grinder.
+    - **[grinder]** The job carries the recipe's target time
+      (`durationExpectedMs`) and target weight (`brewWeightExpectedMg`, 0
+      when *Brew Weight* is not set). The tested recipe sent
+      `doseTypeExpected: 2` (**[unconfirmed]** what the values mean).
+
+    ![State diagram of a brew job: listed, taken, then done or dropped](./lifecycle.svg)
+
+    The diagram's source is `lifecycle.mmd` (Mermaid), next to this file.
+
+    - **[grinder]** A job nobody takes within about **60 s** is dropped.
+    - **[grinder]** A taken job with no `brewDone` is **listed again**
+      about every **50 s**. A shot that takes longer than that (tamping, warming
+      up) needs the machine to take the job again each time it reappears.
+      Then `brewDone` still works.
+    - **[grinder]** `brewDone` needs a taken job.
+      `ClientErrorOngoingJobNotExisting` means the job was listed again in
+      the meantime: send `brewAccept` again, then the same `brewDone`.
+    - **[grinder]** `ClientErrorBrewJobNotExisting` from `brewAccept` means
+      the job is gone: already taken, timed out, or never existed.
+    - **[grinder]** Group heads are counted from **0** in the API and from
+      **1** on the grinder's screen. A job with no `groupHeadId` is for a
+      one-group machine; answer with `groupHeadId: 0`.
+    - **[grinder]** `brewWeightExpectedMg: 0` means the recipe has no target
+      weight. Numbers may come as floats (`28000.0`); read them as numbers,
+      not integers.
+    - **[grinder]** `result: "Canceled"` tells the grinder not to learn from
+      this grind.
+    - **[grinder]** With `Success`, the grinder compares `durationFinalMs`
+      with the recipe's target time and changes the recipe's grind setting.
+      A shot faster than the target makes it grind finer. It does this with
+      `massFinalMg: 0` too, so a shot without a weight still counts.
+
+    ## Timing
+
+    | What | Value | Label |
+    |---|---|---|
+    | Untaken job dropped after | about 60 s | [grinder], approximate |
+    | Taken job listed again, while no `brewDone` | about every 50 s (52 s seen) | [grinder], approximate |
+    | Grinder shows the machine as active (*Diagnosis*) | while the machine keeps polling | [grinder] |
+    | Time without polls before the grinder shows it inactive | unknown | [unconfirmed] |
+    | How long a pairing application stays valid | unknown; the grinder's pairing screen times out by itself | [unconfirmed] |
+    | Grinder restart after the first `pairingStatus` following Accept | about 90 s | [grinder] |
+    | Latest `pairingStatus` after Accept that keeps the pairing | 36 s worked, about 2 min did not | [grinder], one run each |
+    | Silence after a `pairingStatus` gets no answer | 3 min | [client policy] |
+    | Pairing kept while the machine does not poll | at least 9 hours seen | [grinder] |
+    | Job shows up after the grind | at the next poll | [grinder] |
+    | Poll interval (`brewJobs`, `pairingStatus`) | 2 s | [client policy] |
+    | Request timeout | 8 s | [client policy] |
+    | Backoff after a failed request | 2 s, doubling up to 60 s | [client policy] |
+
+    ## Client policy in gbs-anywhere
+
+    These choices are not required by the grinder. They are listed because
+    they handle cases a reimplementation will meet.
+
+    - Take a job **as soon as it is listed**, then take it again whenever it
+      is listed again, until the shot is measured or the machine gives up
+      waiting. Giving up is answered with `brewDone` `Canceled`.
+    - **The newest job is the shot being pulled.** If the person grinds
+      again before pulling, answer the older taken job with `Canceled` and
+      leave other old jobs for the grinder to drop.
+    - Build `brewDone` once, so every retry carries the same
+      `brewEventUuid`. Retry on every poll until `Ok`: for up to 120 s for a
+      measured shot and 20 s for a cancelled one.
+    - When a `pairingStatus` call gets no answer, send the grinder nothing
+      for 3 minutes, then apply again with the same `brewDeviceId`.
+    - Treat a single 403 from `brewJobs` as a grinder that is still starting
+      up. Only after **3 in a row** treat the pairing as cleared and pair
+      again.
+    - When no weight was measured, send the recipe's target weight rather
+      than 0. (0 works too: the grinder still adjusts from the time.)
+    - Declare one group head and `progressSupported: false`.
+    - Reject replies over 64 KiB: replies are a few hundred bytes.
+
+    ## Known unknowns
+
+    - **[unconfirmed]** `brewProgress`: with `progressSupported: true`, the
+      grinder probably expects live progress during a shot. Its path, body
+      and timing are not known. Send `false`.
+    - **[unconfirmed]** Whether firmware other than V01.36 build #2 also
+      restarts on pairing, and whether any firmware sends `accepted: true`
+      with a `pairingId`.
+    - **[unconfirmed]** How soon after Accept the first `pairingStatus` must
+      come for the pairing to survive.
+    - **[unconfirmed]** Whether the grinder announces itself on the network
+      (mDNS, SSDP or a broadcast), so a machine could find it without
+      being given its address.
+    - **[unconfirmed]** Whether the grinder only joins 2.4 GHz WiFi, as the
+      E64 WS does.
+    - **[unconfirmed]** Whether `brewAccept` and `brewDone` also answer 403
+      for an unknown `pairingId`, as `brewJobs` does.
+    - **[unconfirmed]** The order of jobs in `brewJobs`.
+    - **[unconfirmed]** What `doseTypeExpected` values mean (single, double,
+      ...). Echo it back unchanged as `doseType`.
+    - **[unconfirmed]** Status names and `msgType`s other than the ones
+      listed here.
+    - **[unconfirmed]** How the grinder treats very long durations. (The
+      E64 WS rejects shots over 80 s; this API may not.)
+    - **[unconfirmed]** Machines with more than one group head.
+    - **[unconfirmed]** Limits on `name`, `model` and `manufacturer` (length,
+      characters).
+
+    ## Trying it by hand
+
+    The whole flow works with `curl` in a terminal. Keep `-k` (self-signed
+    certificate). The values below are made up and fit together:
+    `applicationId` 5, `pairingCode` 73, `pairingId` 42. Replace them with
+    what your grinder sends. Make sure nothing else talks to the grinder
+    while you try this, such as a running gbs-anywhere.
+
+    ```sh
+    G=https://192.168.1.30:30001          # your grinder's address
+    H='Content-Type: application/json'
+    DEV=$(uuidgen | tr A-Z a-z)           # this machine's brewDeviceId: keep it
+    APPLY='{"version":1,"name":"curl-test","model":"curl-test","manufacturer":"curl-test","brewDeviceId":"'$DEV'","numOfGroupHeads":1,"progressSupported":false}'
+    ```
+
+    ### 1. Pair
+
+    ```sh
+    # Apply. Note applicationId and pairingCode.
+    curl -k $G/grinderApi/pairingApplication -H "$H" -d "$APPLY"
+    ```
+
+    On the grinder: *Generic WiFi → Configuration → Start Pairing*, select
+    **curl-test** (same code) and tap **Accept Pairing**. Then, **within a
+    few seconds**:
+
+    ```sh
+    curl -k --max-time 15 $G/grinderApi/pairingStatus -H "$H" \
+      -d '{"version":1,"applicationId":5}'
+    ```
+
+    On firmware V01.36 build #2 this call times out: the grinder is saving
+    the pairing and restarting. **Send nothing for 3 minutes.** Then apply
+    again with the same `brewDeviceId`:
+
+    ```sh
+    curl -k -i $G/grinderApi/pairingApplication -H "$H" -d "$APPLY"
+    ```
+
+    - `400` with `ClientErrorDevAlreadyPaired`: paired. Read the Pairing ID
+      in the **curl-test** entry on the grinder (first line of
+      *Configuration*, or under *Diagnosis*).
+    - `200` with `Ok`: the pairing was lost. Accept again on the grinder,
+      then repeat the `pairingStatus` call right away.
+
+    Check the Pairing ID:
+
+    ```sh
+    curl -k -i $G/grinderApi/brewJobs -H "$H" -d '{"version":1,"pairingId":42}'
+    ```
+
+    `200` with `"status": "Ok"` means paired; `403` means the ID is wrong.
+
+    ### 2. Poll
+
+    ```sh
+    while true; do
+      curl -k -s $G/grinderApi/brewJobs -H "$H" -d '{"version":1,"pairingId":42}'
+      echo; sleep 2
+    done
+    ```
+
+    While this runs, the grinder lists the machine as *Enable curl-test* in
+    *Machine To Machine*, and its status reads **On**. Stop the loop with
+    Ctrl+C and the status goes back to **Off**. The pairing stays: start
+    polling again with the same `pairingId` at any time.
+
+    ### 3. Answer a grind
+
+    Grind with a Grind-by-Sync recipe (*Enable GbS* on, with *Brew Time*,
+    *Brew Weight* and *GbS start DD* set; the recipe shows a blue chain
+    icon). The next poll lists a job. In a second terminal, take it within
+    about 60 s, with its `grindUuid`, its `groupHeadId` (0 when it has
+    none) and its `doseTypeExpected` as `doseType`:
+
+    ```sh
+    curl -k $G/grinderApi/brewAccept -H "$H" \
+      -d '{"version":1,"pairingId":42,"grindUuid":"<grindUuid>","groupHeadId":0,"doseType":2}'
+    ```
+
+    Pull the shot. If the poll lists the same job again (about every 50 s),
+    take it again with the same command. Then report the shot, here 27.6 s
+    and 39.9 g:
+
+    ```sh
+    curl -k $G/grinderApi/brewDone -H "$H" \
+      -d '{"version":1,"pairingId":42,"grindUuid":"<grindUuid>","durationFinalMs":27600,"massFinalMg":39900,"brewEventUuid":"'$(uuidgen | tr A-Z a-z)'","result":"Success"}'
+    ```
+
+    `ClientErrorOngoingJobNotExisting` means the job was listed again in the
+    meantime: take it again, then send the same `brewDone`.
+
+    ### 4. Clean up
+
+    On the grinder, tap **Clear Pairing** in the **curl-test** entry. This
+    also switches Generic WiFi off: switch it back on before pairing
+    anything else.
+
+# No login or token: after pairing, `pairingId` in the body identifies the machine.
+security: []
+
+servers:
+  - url: https://{grinder}:{port}
+    description: The grinder on your network (self-signed certificate).
+    variables:
+      grinder:
+        default: 192.168.1.30
+        description: The grinder's IP address or host name.
+      port:
+        default: "30001"
+        description: The Generic WiFi API port.
+
+tags:
+  - name: Pairing
+    description: |
+      Done once. The machine applies, the person accepts it on the grinder,
+      and the machine receives the `pairingId` it uses from then on.
+  - name: Brew jobs
+    description: |
+      After pairing. The machine polls for jobs, takes the one for the shot
+      being pulled, and answers it with the shot's time and weight.
+
+x-tagGroups:
+  - name: Generic WiFi
+    tags:
+      - Pairing
+      - Brew jobs
+
+paths:
+  /grinderApi/pairingApplication:
+    post:
+      operationId: pairingApplication
+      tags: [Pairing]
+      summary: Apply to pair
+      description: |
+        Asks the grinder to pair with this machine. The grinder lists it under
+        **Available devices** (by `name`, with the `pairingCode`) while the
+        person has pairing started on the grinder.
+
+        - **[grinder]** `brewDeviceId` identifies the machine. Generate it
+          once and keep it: the grinder refuses a second application from a
+          device it has paired (`ClientErrorDevAlreadyPaired`).
+        - **[grinder]** Applying again with the same `brewDeviceId` while the
+          application is open returns the same `applicationId` and
+          `pairingCode`.
+        - **[grinder]** After the grinder restarts on pairing,
+          `ClientErrorDevAlreadyPaired` confirms the pairing was kept, and
+          `Ok` that it was lost.
+        - **[client policy]** Apply again whenever `pairingStatus` says the
+          application is unknown.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairingApplicationRequest'
+            examples:
+              oneGroup:
+                summary: A one-group machine without live progress
+                value:
+                  version: 1
+                  name: my-machine
+                  model: my-machine
+                  manufacturer: my-machine
+                  brewDeviceId: 3f2b8c1e-5a7d-4e9b-9c61-2d4f8a0b7e15
+                  numOfGroupHeads: 1
+                  progressSupported: false
+      responses:
+        '200':
+          description: Application received. Show `pairingCode` to the person.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairingApplicationReply'
+              examples:
+                ok:
+                  value:
+                    status: Ok
+                    msgType: pairingApplicationRes
+                    applicationId: 5
+                    pairingCode: 73
+          links:
+            checkPairing:
+              operationId: pairingStatus
+              description: Send `applicationId` to `pairingStatus` until it is accepted.
+        '400':
+          $ref: '#/components/responses/ClientError'
+
+  /grinderApi/pairingStatus:
+    post:
+      operationId: pairingStatus
+      tags: [Pairing]
+      summary: Check the application
+      description: |
+        Asks whether the person has accepted the application on the grinder.
+        Call it every few seconds until `accepted` is `true`.
+
+        - **[grinder]** On firmware V01.36 build #2, the first call after the
+          person accepts **gets no reply**: the grinder stores the pairing,
+          freezes and restarts. Send nothing for 3 minutes, then apply again
+          (see *Pairing* above). The `accepted: true` reply below is never
+          sent there.
+        - **[grinder]** `ClientErrorPairingAppIdNotFound`: the application
+          expired or the grinder restarted. Apply again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairingStatusRequest'
+            examples:
+              check:
+                value:
+                  version: 1
+                  applicationId: 5
+      responses:
+        '200':
+          description: The application's state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairingStatusReply'
+              examples:
+                waiting:
+                  summary: Not accepted yet
+                  value:
+                    status: Ok
+                    msgType: pairingStatusRes
+                    accepted: false
+                accepted:
+                  summary: Accepted on the grinder (not sent by firmware V01.36 build 2)
+                  value:
+                    status: Ok
+                    msgType: pairingStatusRes
+                    accepted: true
+                    pairingId: 42
+          links:
+            pollJobs:
+              operationId: brewJobs
+              description: Use `pairingId` in every request from now on.
+        '400':
+          $ref: '#/components/responses/ClientError'
+
+  /grinderApi/brewJobs:
+    post:
+      operationId: brewJobs
+      tags: [Brew jobs]
+      summary: List brew jobs
+      description: |
+        Lists the jobs waiting for a machine. Each Grind-by-Sync grind adds
+        one. Call it every few seconds for as long as the machine runs.
+
+        - **[grinder]** While the machine polls, the grinder shows it as
+          active in *Diagnosis*.
+        - **[grinder]** A taken job is not listed, until it is listed again
+          about every 50 s while no `brewDone` follows.
+        - **[grinder]** HTTP **403**: the grinder does not know this
+          `pairingId`. The pairing was cleared on the grinder, or the ID is
+          wrong.
+        - **[client policy]** One 403 can be a grinder that is still
+          starting up. Pair again after three in a row.
+        - **[client policy]** Also use this call to check a Pairing ID the
+          person typed in.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairedRequest'
+            examples:
+              poll:
+                value:
+                  version: 1
+                  pairingId: 42
+      responses:
+        '200':
+          description: The open jobs. Usually none or one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrewJobsReply'
+              examples:
+                idle:
+                  summary: Nothing to do
+                  value:
+                    status: Ok
+                    msgType: brewJobsRes
+                    brewJobs: []
+                oneJob:
+                  summary: A grind with a 28 s, 40 g recipe
+                  value:
+                    status: Ok
+                    msgType: brewJobsRes
+                    brewJobs:
+                      - grindUuid: 8d1e4c2a-7b3f-4a90-b5e6-0c9d2f1a3e47
+                        doseTypeExpected: 2
+                        durationExpectedMs: 28000
+                        brewWeightExpectedMg: 40000
+          links:
+            takeJob:
+              operationId: brewAccept
+              description: Take a listed job by its `grindUuid`.
+        '403':
+          $ref: '#/components/responses/UnknownPairing'
+        '400':
+          $ref: '#/components/responses/ClientError'
+
+  /grinderApi/brewAccept:
+    post:
+      operationId: brewAccept
+      tags: [Brew jobs]
+      summary: Take a job
+      description: |
+        Takes a listed job: the machine will pull this shot. The job is no
+        longer listed for other machines.
+
+        - **[grinder]** Take it within about 60 s of it being listed, or the
+          grinder drops it.
+        - **[grinder]** Take it again each time it is listed again (about
+          every 50 s while no `brewDone` follows). That keeps it open for a
+          long shot.
+        - **[grinder]** `ClientErrorBrewJobNotExisting`: the job is gone, or
+          already taken (for example, an earlier `brewAccept` went through
+          but its reply was lost). If you have a result, try `brewDone`: it
+          says which.
+        - **[grinder]** `groupHeadId` counts from 0. Echo the job's
+          `doseTypeExpected` as `doseType`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrewAcceptRequest'
+            examples:
+              take:
+                value:
+                  version: 1
+                  pairingId: 42
+                  grindUuid: 8d1e4c2a-7b3f-4a90-b5e6-0c9d2f1a3e47
+                  groupHeadId: 0
+                  doseType: 2
+      responses:
+        '200':
+          description: The job is taken.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkReply'
+              examples:
+                ok:
+                  value:
+                    status: Ok
+                    msgType: brewAcceptRes
+                    grindUuid: 8d1e4c2a-7b3f-4a90-b5e6-0c9d2f1a3e47
+          links:
+            reportShot:
+              operationId: brewDone
+              description: Answer the same `grindUuid` once the shot is measured.
+        '400':
+          $ref: '#/components/responses/ClientError'
+
+  /grinderApi/brewDone:
+    post:
+      operationId: brewDone
+      tags: [Brew jobs]
+      summary: Report the shot
+      description: |
+        Answers a taken job with the shot as measured. With `Success`, the
+        grinder compares it with the recipe and adjusts its grind setting.
+
+        - **[grinder]** The job must be taken.
+          `ClientErrorOngoingJobNotExisting` means it was listed again in the
+          meantime: send `brewAccept` again, then this same request.
+        - **[grinder]** `Canceled` makes the grinder skip this grind. Send it
+          for an aborted shot, or when the shot never came.
+        - **[client policy]** Create `brewEventUuid` once per shot and keep it
+          on every retry. Retry until `Ok`: up to 120 s for a measured shot,
+          20 s for a cancelled one.
+        - **[client policy]** For `Canceled`, gbs-anywhere sends 0 for the
+          duration and the mass.
+        - **[grinder]** The grinder adjusts from the time even with
+          `massFinalMg: 0`.
+        - **[unconfirmed]** How the grinder treats very long durations.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrewDoneRequest'
+            examples:
+              measured:
+                summary: A 27.6 s shot of 39.9 g
+                value:
+                  version: 1
+                  pairingId: 42
+                  grindUuid: 8d1e4c2a-7b3f-4a90-b5e6-0c9d2f1a3e47
+                  durationFinalMs: 27600
+                  massFinalMg: 39900
+                  brewEventUuid: c4a7e2f0-1b9d-4e36-8f25-6a0d3b7c9e18
+                  result: Success
+              cancelled:
+                summary: The shot was aborted
+                value:
+                  version: 1
+                  pairingId: 42
+                  grindUuid: 8d1e4c2a-7b3f-4a90-b5e6-0c9d2f1a3e47
+                  durationFinalMs: 0
+                  massFinalMg: 0
+                  brewEventUuid: 5e8b1d3c-9a2f-4c07-b6e4-1f3a7d0c2b98
+                  result: Canceled
+      responses:
+        '200':
+          description: The grinder has the result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkReply'
+              examples:
+                ok:
+                  value:
+                    status: Ok
+                    msgType: brewDoneRes
+                    grindUuid: 8d1e4c2a-7b3f-4a90-b5e6-0c9d2f1a3e47
+        '400':
+          $ref: '#/components/responses/ClientError'
+
+components:
+  responses:
+    ClientError:
+      description: |
+        The grinder refused the request (HTTP 400). A `ClientError…` is not
+        fixed by sending the same request again, except where an operation
+        says otherwise.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorReply'
+          examples:
+            applicationUnknown:
+              summary: pairingStatus, the application expired
+              value:
+                status: ClientErrorPairingAppIdNotFound
+                msgType: pairingStatusRes
+            alreadyPaired:
+              summary: pairingApplication, this device is paired already
+              value:
+                status: ClientErrorDevAlreadyPaired
+                msgType: pairingApplicationRes
+            jobUnknown:
+              summary: brewAccept, the job is gone
+              value:
+                status: ClientErrorBrewJobNotExisting
+                msgType: brewAcceptRes
+            ongoingJobUnknown:
+              summary: brewDone, the job is not taken
+              value:
+                status: ClientErrorOngoingJobNotExisting
+                msgType: brewDoneRes
+    UnknownPairing:
+      description: |
+        The grinder does not know this `pairingId`: the pairing was cleared on
+        the grinder, or the ID is wrong. **[grinder]** The body is empty.
+
+  schemas:
+    Version:
+      type: integer
+      const: 1
+      description: The API version. **[grinder]** Required in every request.
+
+    PairingId:
+      type: integer
+      minimum: 0
+      maximum: 4294967295
+      description: |
+        Identifies the paired machine in every request after pairing. The
+        grinder also shows it in the machine's entry.
+      examples: [42]
+
+    GrindUuid:
+      type: string
+      description: Identifies one Grind-by-Sync grind and its brew job.
+      examples: [8d1e4c2a-7b3f-4a90-b5e6-0c9d2f1a3e47]
+
+    Status:
+      type: string
+      description: |
+        `Ok`, or an error name starting with `ClientError`.
+        **[unconfirmed]** Other names than the ones listed in this document.
+      examples: [Ok]
+
+    MsgType:
+      type: string
+      description: |
+        The reply's type: the request's name followed by `Res`
+        (`pairingApplicationRes`, `pairingStatusRes`, `brewJobsRes`,
+        `brewAcceptRes`, `brewDoneRes`).
+      examples: [brewJobsRes]
+
+    OkReply:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: Ok
+        msgType:
+          $ref: '#/components/schemas/MsgType'
+        grindUuid:
+          $ref: '#/components/schemas/GrindUuid'
+          description: Sent back in `brewAccept` and `brewDone` replies.
+
+    ErrorReply:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          pattern: '^ClientError'
+          description: The known names, by operation.
+          examples:
+            - ClientErrorPairingAppIdNotFound
+            - ClientErrorDevAlreadyPaired
+            - ClientErrorBrewJobNotExisting
+            - ClientErrorOngoingJobNotExisting
+        msgType:
+          $ref: '#/components/schemas/MsgType'
+
+    PairingApplicationRequest:
+      type: object
+      required: [version, name, model, manufacturer, brewDeviceId, numOfGroupHeads, progressSupported]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        name:
+          type: string
+          description: |
+            Shown on the grinder, under **Available devices** and then as the
+            name of the Generic WiFi entry.
+        model:
+          type: string
+        manufacturer:
+          type: string
+        brewDeviceId:
+          type: string
+          description: |
+            Identifies the machine to the grinder. Generate once (a UUID) and
+            keep across restarts.
+        numOfGroupHeads:
+          type: integer
+          minimum: 1
+          description: |
+            How many group heads the machine has. **[unconfirmed]** values
+            above 1.
+        progressSupported:
+          type: boolean
+          description: |
+            Whether the machine sends live progress during a shot.
+            **[unconfirmed]** how; send `false`.
+
+    PairingApplicationReply:
+      type: object
+      required: [status]
+      properties:
+        status:
+          $ref: '#/components/schemas/Status'
+        msgType:
+          $ref: '#/components/schemas/MsgType'
+        applicationId:
+          type: integer
+          description: Send it to `pairingStatus`.
+        pairingCode:
+          type: integer
+          description: |
+            Shown on the grinder next to the machine's name. Show it to the
+            person too, so they accept the right device.
+
+    PairingStatusRequest:
+      type: object
+      required: [version, applicationId]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        applicationId:
+          type: integer
+
+    PairingStatusReply:
+      type: object
+      required: [status]
+      properties:
+        status:
+          $ref: '#/components/schemas/Status'
+        msgType:
+          $ref: '#/components/schemas/MsgType'
+        accepted:
+          type: boolean
+          default: false
+          description: Missing means `false`.
+        pairingId:
+          $ref: '#/components/schemas/PairingId'
+
+    PairedRequest:
+      type: object
+      required: [version, pairingId]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        pairingId:
+          $ref: '#/components/schemas/PairingId'
+
+    BrewJob:
+      type: object
+      required: [grindUuid]
+      description: |
+        One Grind-by-Sync grind waiting for its shot. **[grinder]** Numbers
+        may come as floats (`28000.0`).
+      properties:
+        grindUuid:
+          $ref: '#/components/schemas/GrindUuid'
+        groupHeadId:
+          type: integer
+          minimum: 0
+          description: |
+            The group, counted from 0 (group 1 on the grinder's screen is 0).
+            Missing for a one-group machine.
+        doseTypeExpected:
+          description: |
+            The dose (single, double, ...) as a number. **[unconfirmed]** what
+            each value means. Echo it as `doseType` in `brewAccept`.
+        durationExpectedMs:
+          type: number
+          description: The recipe's target time.
+        brewWeightExpectedMg:
+          type: number
+          description: The recipe's target weight in the cup. 0 when the recipe has none.
+
+    BrewJobsReply:
+      type: object
+      required: [status]
+      properties:
+        status:
+          $ref: '#/components/schemas/Status'
+        msgType:
+          $ref: '#/components/schemas/MsgType'
+        brewJobs:
+          type: array
+          default: []
+          items:
+            $ref: '#/components/schemas/BrewJob'
+
+    BrewAcceptRequest:
+      type: object
+      required: [version, pairingId, grindUuid, groupHeadId]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        pairingId:
+          $ref: '#/components/schemas/PairingId'
+        grindUuid:
+          $ref: '#/components/schemas/GrindUuid'
+        groupHeadId:
+          type: integer
+          minimum: 0
+          description: The job's `groupHeadId`, or 0 when it has none.
+        doseType:
+          description: The job's `doseTypeExpected`, unchanged (`null` when it has none).
+
+    BrewDoneRequest:
+      type: object
+      required: [version, pairingId, grindUuid, durationFinalMs, massFinalMg, brewEventUuid, result]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        pairingId:
+          $ref: '#/components/schemas/PairingId'
+        grindUuid:
+          $ref: '#/components/schemas/GrindUuid'
+        durationFinalMs:
+          type: integer
+          minimum: 0
+          description: The shot's time.
+        massFinalMg:
+          type: integer
+          minimum: 0
+          description: |
+            The shot's weight in the cup. **[client policy]** gbs-anywhere caps
+            it at 5,000,000 mg (5 kg) to catch typos.
+        brewEventUuid:
+          type: string
+          description: New for every shot; the same on every retry of it.
+        result:
+          type: string
+          enum: [Success, Canceled]
+          description: '`Canceled` makes the grinder skip this grind.'

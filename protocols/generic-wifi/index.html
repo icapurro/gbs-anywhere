@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Grind-by-Sync Generic WiFi API</title>
+  <!--
+    Renders openapi.yaml (next to this file) with Scalar. Serve the folder
+    over HTTP, e.g. `npx serve protocols/generic-wifi`, then open the address
+    it prints: browsers don't let a file:// page load it.
+  -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+  <style>
+    body { margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.72.1/dist/browser/standalone.js"></script>
+  <script>
+    Scalar.createApiReference('#app', {
+      url: './openapi.yaml',
+      // The grinder is on the local network: a hosted proxy cannot reach it.
+      proxyUrl: undefined,
+      withDefaultFonts: false,
+      telemetry: false,
+      hideModels: false,
+      defaultOpenAllTags: true,
+      customCss: `
+        :root {
+          --scalar-font: 'IBM Plex Sans', system-ui, sans-serif;
+          --scalar-font-code: 'IBM Plex Mono', ui-monospace, monospace;
+        }
+        .light-mode { --scalar-color-accent: #8a4b22; }
+        .dark-mode { --scalar-color-accent: #d9a273; }
+      `,
+    })
+  </script>
+</body>
+</html>

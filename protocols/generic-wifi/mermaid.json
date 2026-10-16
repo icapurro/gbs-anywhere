@@ -1,0 +1,10 @@
+{
+  "theme": "neutral",
+  "themeVariables": {
+    "fontFamily": "IBM Plex Sans, Helvetica, Arial, sans-serif"
+  },
+  "sequence": {
+    "mirrorActors": false,
+    "showSequenceNumbers": true
+  }
+}

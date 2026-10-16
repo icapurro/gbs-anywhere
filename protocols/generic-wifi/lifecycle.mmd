@@ -1,0 +1,21 @@
+%% The brew job lifecycle, rendered to lifecycle.svg. To regenerate:
+%%   npx -p @mermaid-js/mermaid-cli@11.17.0 mmdc -i lifecycle.mmd -o lifecycle.svg -c mermaid.json -b white
+stateDiagram-v2
+    direction LR
+
+    Listed: Listed<br/>(shown in brewJobs)
+    Taken: Taken<br/>(hidden from brewJobs)
+    Dropped: Dropped
+    Adjusted: Done, grinder adjusts
+    Skipped: Done, grinder skips it
+
+    [*] --> Listed: person grinds with a GbS recipe
+    Listed --> Taken: brewAccept
+    Listed --> Dropped: not taken for ~60 s
+    Taken --> Listed: no brewDone for ~50 s
+    Taken --> Adjusted: brewDone Success
+    Taken --> Skipped: brewDone Canceled
+    Dropped --> [*]
+    Adjusted --> [*]
+    Skipped --> [*]
+

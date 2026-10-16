@@ -1,0 +1,58 @@
+%% The Generic WiFi flow, rendered to sequence.svg. To regenerate:
+%%   npx -p @mermaid-js/mermaid-cli@11.17.0 mmdc -i sequence.mmd -o sequence.svg -c mermaid.json -b white
+sequenceDiagram
+    autonumber
+    participant M as Machine (client)
+    participant G as Grinder :30001
+    actor P as Person
+
+    rect rgba(138, 75, 34, 0.08)
+    Note over M,P: 1. Pairing (once)
+    M->>G: pairingApplication {brewDeviceId, name, ...}
+    G-->>M: {applicationId: 5, pairingCode: 73}
+    P->>G: Start Pairing
+    Note over G,P: lists the machine by name, with code 73
+    loop every 2 s, until the person accepts
+        M->>G: pairingStatus {applicationId: 5}
+        G-->>M: {accepted: false}
+    end
+    P->>G: Accept Pairing
+    M-xG: pairingStatus {applicationId: 5}, within seconds
+    Note over G,P: stores the pairing, sends no reply,<br/>freezes, restarts after about 90 s
+    Note over M,G: no answer: send nothing for 3 min
+    M->>G: pairingApplication (same brewDeviceId)
+    G-->>M: 400 {status: ClientErrorDevAlreadyPaired}
+    P->>M: types the Pairing ID shown on the grinder (42)
+    M->>G: brewJobs {pairingId: 42}
+    G-->>M: {status: Ok, brewJobs: []}
+    Note over M: stores brewDeviceId + pairingId
+    end
+
+    rect rgba(138, 75, 34, 0.04)
+    Note over M,P: 2. Waiting for a grind (every few seconds, for as long as it runs)
+    M->>G: brewJobs {pairingId: 42}
+    G-->>M: {brewJobs: []}
+    P->>G: grinds with a GbS recipe
+    M->>G: brewJobs {pairingId: 42}
+    G-->>M: {brewJobs: [{grindUuid, durationExpectedMs, ...}]}
+    end
+
+    rect rgba(138, 75, 34, 0.08)
+    Note over M,P: 3. Taking the job
+    M->>G: brewAccept {pairingId, grindUuid, groupHeadId: 0}
+    G-->>M: {status: Ok}
+    P->>M: pulls, times and weighs the shot
+    opt shot takes longer than ~50 s
+        M->>G: brewJobs {pairingId: 42}
+        G-->>M: {brewJobs: [same job, listed again]}
+        M->>G: brewAccept (same grindUuid)
+        G-->>M: {status: Ok}
+    end
+    end
+
+    rect rgba(138, 75, 34, 0.04)
+    Note over M,P: 4. Reporting the shot
+    M->>G: brewDone {grindUuid, durationFinalMs, massFinalMg, result}
+    G-->>M: {status: Ok}
+    G->>P: adjusts the grind setting
+    end

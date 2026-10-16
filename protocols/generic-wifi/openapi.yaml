@@ -131,7 +131,7 @@ info:
 
     ## The whole flow
 
-    ![Sequence diagram: pairing, waiting for a grind, taking the job and reporting the shot](./sequence.svg)
+    ![Sequence diagram: pairing, waiting for a grind, taking the job and reporting the shot](https://cdn.jsdelivr.net/gh/icapurro/gbs-anywhere@329b038b39f05a58169c7bfa75fac2adc6b9b4ff/protocols/generic-wifi/sequence.svg)
 
     The diagram's source is `sequence.mmd` (Mermaid), next to this file.
 
@@ -245,7 +245,7 @@ info:
       when *Brew Weight* is not set). The tested recipe sent
       `doseTypeExpected: 2` (**[unconfirmed]** what the values mean).
 
-    ![State diagram of a brew job: listed, taken, then done or dropped](./lifecycle.svg)
+    ![State diagram of a brew job: listed, taken, then done or dropped](https://cdn.jsdelivr.net/gh/icapurro/gbs-anywhere@329b038b39f05a58169c7bfa75fac2adc6b9b4ff/protocols/generic-wifi/lifecycle.svg)
 
     The diagram's source is `lifecycle.mmd` (Mermaid), next to this file.
 
